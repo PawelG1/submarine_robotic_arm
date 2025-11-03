@@ -1,447 +1,170 @@
-#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 import can
 import struct
 from std_msgs.msg import Bool, Float32
 
-class ODriveCANNode(Node):
-    def __init__(self):
-        super().__init__('odrive_can_node')
-        try:
-            self.bus = can.ThreadSafeBus(interface='socketcan', channel='can0')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to connect to CAN bus: {exc}. CAN functionality disabled.')
-            self.bus = None
-            return  # Skip the rest of init
 
-        self.get_logger().info('ODrive CAN node started')
-        if self.bus is not None:
-            self.set_axis_node_id(0)  # Ensure node ID is 0
-            self.set_control_mode()  # Set to velocity control with vel_ramp input
-            self.set_limits(400.0, 10.0)  # Set velocity limit to 400 rad/s, current limit to 10A
-            self.send_velocity_setpoint(0.0)  # Initialize to 0 velocity
-            self.request_errors()  # Request error status on startup
-            self.notifier = can.Notifier(self.bus, [self.receive_message])
-        else:
-            self.get_logger().warn('CAN bus not available, skipping notifier setup')
-        # self.create_subscription(Bool,
-        #                          'odrive/calibrate_offset',
-        #                          self.calibrate_offset_callback,
-        #                          10)
+class ODriveCANNode(Node):
+
+    def __init__(self): # Initialize the ODrive CAN node
+        # Initialize CAN bus and ROS2 node
+        super().__init__('odrive_can_node') 
+        try:
+            self.bus = can.ThreadSafeBus(channel='can0', interface='socketcan') # Connect to CAN bus
+        except can.CanError as exc:
+            self.get_logger().error(f'Failed to connect to CAN bus: {exc}')
+            raise # Exit if CAN bus is not available
+
+        self.get_logger().info('ODrive CAN node started') # Configure ODrive logger
+
+        # Calibrate ODrive settings
+        self.set_axis_node_id(0)  # Ensure node ID is 0
+        self.set_control_mode()  # Set to velocity control with vel_ramp input
+        self.set_limits(400.0, 10.0)  # Set velocity limit to 400 rad/s, current limit to 10A
+        self.send_velocity_setpoint(0.0)  # Initialize to 0 velocity
+        self.request_errors()  # Request error status on startup
+
+        # Set up CAN message notifier and periodic command sender
+        self.notifier = can.Notifier(self.bus, [self.receive_message]) # Set up CAN message notifier
+        self.timer = self.create_timer(0.02, self.send_commands) # 50 Hz command sending
+
+        self.get_logger().info('ODrive CAN node started successfully.')
+        # Set up ROS2 subscriptions
+        self.create_subscription(Bool,
+                                 'odrive/calibrate_offset',
+                                 self.calibrate_offset_callback,
+                                 10) # Subscribe to calibrate offset command, Service callback
         self.create_subscription(Bool,
                                  'odrive/reset_errors',
                                  self.reset_errors_callback,
-                                 10)
-        self.create_subscription(Float32,
-                                 'odrive/vel_limit',
-                                 self.vel_limit_callback,
-                                 10)
-        self.create_subscription(Float32,
-                                 'odrive/current_limit',
-                                 self.current_limit_callback,
-                                 10)
-        self.create_subscription(Float32,
-                                 'odrive/rotate_duration',
-                                 self.rotate_callback,
-                                 10)
+                                 10) # Subscribe to reset errors command, Service callback                 
         self.create_subscription(Float32,
                                  'odrive/velocity_setpoint',
                                  self.velocity_setpoint_callback,
-                                 10)
-        self.cealibrate_offset = False
-        self.vel_limit = 1000.0  # Default velocity limit
-        self.current_limit = 10.0  # Default current limit
-        self.rotate_timer = None
+                                 10) # Subscribe to velocity setpoint command
 
-    def set_control_mode(self):
-        """Set ODrive control mode to velocity control with vel_ramp input."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping control mode setup')
-            return
-        control_mode = 2  # VELOCITY_CONTROL
-        input_mode = 1    # VEL_RAMP
-        data = control_mode.to_bytes(4, 'little') + input_mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x0B] + list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info('Set control mode to velocity control with vel_ramp input')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set control mode: {exc}')
+    # Define methods to configure ODrive via CAN
 
+    # Set axis node ID
     def set_axis_node_id(self, node_id: int):
-        """Set ODrive axis node ID."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping node ID setup')
-            return
-        data = node_id.to_bytes(4, 'little')
+        data = node_id.to_bytes(4, 'little') # Prepare data to set node ID, Little-endian
         try:
-            frame = can.Message(arbitration_id=0x006,  # Command 0x006
+            arbitration_id = 0x006 # Command Set Axis Node ID
+
+            frame = can.Message(arbitration_id=arbitration_id,  # Command Set Axis Node ID
                                 data=list(data),
                                 is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set axis node ID to {node_id}')
+            self.bus.send(frame) # Send CAN frame to set node ID
+            self.get_logger().info(f'Set axis node ID to {node_id}') # Log success
         except can.CanError as exc:
-            self.get_logger().error(f'Failed to set node ID: {exc}')
+            self.get_logger().error(f'Failed to set node ID: {exc}') # Log failure
 
+    # Set control mode to VELOCITY_CONTROL with VEL_RAMP input
     def set_control_mode(self):
-        """Set ODrive control mode to velocity control with vel_ramp input."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping control mode setup')
-            return
         control_mode = 2  # VELOCITY_CONTROL
         input_mode = 1    # VEL_RAMP
-        data = control_mode.to_bytes(4, 'little') + input_mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x0B,  # Command 0x0B for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info('Set control mode to velocity control with vel_ramp input')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set control mode: {exc}')
 
+        data = control_mode.to_bytes(4, 'little') + input_mode.to_bytes(4, 'little') # Prepare data to set control mode, Little-endian
+
+        try:
+            node_id = 0  # jeśli Twoja oś ma ID = 0
+            cmd_id = 0x0B  # CMD_SET_CONTROL_MODE
+            arbitration_id = 0x200 * node_id + cmd_id # Calculate arbitration ID for your node and control mode
+
+            # Prepare data to set control mode
+            frame = can.Message(
+                arbitration_id=arbitration_id, # Standard protocol for Firmware ODrive 0.5.1 and later
+                data=list(data),
+                is_extended_id=False
+            )
+
+            self.bus.send(frame) # Send CAN frame to set control mode
+
+            self.get_logger().info(f'Set control mode to VELOCITY_CONTROL: {control_mode} + VEL_RAMP: {input_mode} (ID=0x{arbitration_id:X})')
+            # Log success
+
+        except can.CanError as exc:
+            self.get_logger().error(f'Failed to set control mode: {exc}') # Log failure
+
+    # Set velocity and current limits
     def set_limits(self, vel_limit: float, current_limit: float):
-        """Set ODrive velocity and current limits."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping limits setup')
-            return
-        vel_data = struct.pack('<f', vel_limit)
-        current_data = struct.pack('<f', current_limit)
-        data = vel_data + current_data
+
+        # Set ODrive velocity and current limits
+        vel_data = struct.pack('<f', vel_limit) # Prepare velocity limit data, float 32bit little-endian
+        current_data = struct.pack('<f', current_limit) # Prepare current limit data, float 32bit little-endian
+        data = vel_data + current_data # Combine velocity and current limit data, 8 bytes total
+
         try:
-            frame = can.Message(arbitration_id=0x0C,  # Command 0x0C for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
+            node_id = 0  # jeśli Twoja oś ma ID = 0
+            arbitration_id = 0x0C + node_id # Calculate arbitration ID for your node
+
+            frame = can.Message(
+                arbitration_id=arbitration_id,  # Standard protocol for Firmware ODrive 0.5.1 and later
+                data=list(data),
+                is_extended_id=False
+            )
+
+            self.bus.send(frame) # Send CAN frame to set limits
+
             self.get_logger().info(f'Set limits: velocity {vel_limit}, current {current_limit}')
+            # Log success
+
         except can.CanError as exc:
-            self.get_logger().error(f'Failed to set limits: {exc}')
+            self.get_logger().error(f'Failed to set limits: {exc}') # Log failure
 
-    def set_motor_config(self, pole_pairs: int):
-        """Set ODrive motor configuration."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping motor config')
-            return
-        calibration_current = 10.0
-        resistance_calib_max_voltage = 4.0
-        phase_inductance = 0.0
-        phase_resistance = 0.0
-        data = (pole_pairs.to_bytes(4, 'little') +
-                struct.pack('<f', calibration_current) +
-                struct.pack('<f', resistance_calib_max_voltage) +
-                struct.pack('<f', phase_inductance) +
-                struct.pack('<f', phase_resistance))
-        try:
-            frame = can.Message(arbitration_id=0x0E,  # Command 0x0E for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set motor config: pole_pairs={pole_pairs}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set motor config: {exc}')
-
-    def set_encoder_mode(self, mode: int):
-        """Set ODrive encoder mode."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping encoder mode')
-            return
-        data = mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x0D,  # Command 0x0D for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set encoder mode to {mode}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set encoder mode: {exc}')
-
-    def set_control_mode(self):
-        """Set ODrive control mode to velocity control with vel_ramp input."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping control mode setup')
-            return
-        control_mode = 2  # VELOCITY_CONTROL
-        input_mode = 1    # VEL_RAMP
-        data = control_mode.to_bytes(4, 'little') + input_mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x0B,  # Command 0x0B for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info('Set control mode to velocity control with vel_ramp input')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set control mode: {exc}')
-
-    def set_limits(self, vel_limit: float, current_limit: float):
-        """Set ODrive velocity and current limits."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping limits setup')
-            return
-        vel_data = struct.pack('<f', vel_limit)
-        current_data = struct.pack('<f', current_limit)
-        data = vel_data + current_data
-        try:
-            frame = can.Message(arbitration_id=0x0C,  # Command 0x0C for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set limits: velocity {vel_limit}, current {current_limit}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set limits: {exc}')
-
-    def set_motor_config(self, pole_pairs: int):
-        """Set ODrive motor configuration."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping motor config')
-            return
-        calibration_current = 10.0
-        resistance_calib_max_voltage = 4.0
-        phase_inductance = 0.0
-        phase_resistance = 0.0
-        data = (pole_pairs.to_bytes(4, 'little') +
-                struct.pack('<f', calibration_current) +
-                struct.pack('<f', resistance_calib_max_voltage) +
-                struct.pack('<f', phase_inductance) +
-                struct.pack('<f', phase_resistance))
-        try:
-            frame = can.Message(arbitration_id=0x0E,  # Command 0x0E for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set motor config: pole_pairs={pole_pairs}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set motor config: {exc}')
-
-    def set_encoder_mode(self, mode: int):
-        """Set ODrive encoder mode."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping encoder mode')
-            return
-        data = mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x0D,  # Command 0x0D for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set encoder mode to {mode}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set encoder mode: {exc}')
-
-    def set_control_mode(self):
-        """Set ODrive control mode to velocity control with vel_ramp input."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping control mode setup')
-            return
-        control_mode = 2  # VELOCITY_CONTROL
-        input_mode = 1    # VEL_RAMP
-        data = control_mode.to_bytes(4, 'little') + input_mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x0B,  # Command 0x0B for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info('Set control mode to velocity control with vel_ramp input')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set control mode: {exc}')
-
-    def set_limits(self, vel_limit: float, current_limit: float):
-        """Set ODrive velocity and current limits."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping limits setup')
-            return
-        vel_data = struct.pack('<f', vel_limit)
-        current_data = struct.pack('<f', current_limit)
-        data = vel_data + current_data
-        try:
-            frame = can.Message(arbitration_id=0x0C,  # Command 0x0C for node 0
-                                data=list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set limits: velocity {vel_limit}, current {current_limit}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set limits: {exc}')
-
-    def set_motor_config(self, pole_pairs: int):
-        """Set ODrive motor configuration."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping motor config')
-            return
-        calibration_current = 10.0
-        resistance_calib_max_voltage = 4.0
-        phase_inductance = 0.0
-        phase_resistance = 0.0
-        data = (pole_pairs.to_bytes(4, 'little') +
-                struct.pack('<f', calibration_current) +
-                struct.pack('<f', resistance_calib_max_voltage) +
-                struct.pack('<f', phase_inductance) +
-                struct.pack('<f', phase_resistance))
-        try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x0E] + list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set motor config: pole_pairs={pole_pairs}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set motor config: {exc}')
-
-    def set_encoder_mode(self, mode: int):
-        """Set ODrive encoder mode."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping encoder mode')
-            return
-        data = mode.to_bytes(4, 'little')
-        try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x0D] + list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set encoder mode to {mode}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set encoder mode: {exc}')
-
-    def set_limits(self, vel_limit: float, current_limit: float):
-        """Set ODrive velocity and current limits."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, skipping limits setup')
-            return
-        vel_data = struct.pack('<f', vel_limit)
-        current_data = struct.pack('<f', current_limit)
-        data = vel_data + current_data
-        try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x0C] + list(data),
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info(f'Set limits: velocity {vel_limit}, current {current_limit}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to set limits: {exc}')
-#         """Send periodic control and status request frames."""
-#         # Enter closed-loop control
-#         try:
-#             msg = can.Message(arbitration_id=0x207,
-#                               data=[0x07, 0x00, 0x00, 0x00],
-#                               is_extended_id=False)
-#             self.bus.send(msg)
-#         except can.CanError as exc:
-#             self.get_logger().error(f'Failed to send control frame: {exc}')
-
-#         # Request encoder estimates (remote frame)
-#         try:
-#             req = can.Message(arbitration_id=0x009,
-#                               is_extended_id=False,
-#                               is_remote_frame=True,
-#                               dlc=8)
-#             self.bus.send(req)
-#         except can.CanError as exc:
-#             self.get_logger().error(f'Failed to request status: {exc}')
-
-    def receive_message(self, msg: can.Message):
-        """Handle incoming CAN frames."""
-        if msg.arbitration_id == 0x009 and not msg.is_remote_frame:
-            pos = int.from_bytes(msg.data[0:4], byteorder='little', signed=True) / 100000.0
-            vel = int.from_bytes(msg.data[4:8], byteorder='little', signed=True) / 100000.0
-            self.get_logger().info(f'Pos: {pos:.2f}, Vel: {vel:.2f}')
-        elif msg.arbitration_id == 0x018 and not msg.is_remote_frame:
-            error_code = int.from_bytes(msg.data[0:4], byteorder='little')
-            self.get_logger().info(f'Error code: {error_code}')
-        else:
-            self.get_logger().debug(f'Received CAN frame: {msg}')
-
-    def vel_limit_callback(self, msg: Float32):
-        """Set the ODrive velocity limit."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, ignoring velocity limit command')
-            return
-        self.vel_limit = msg.data
-        self.set_limits(self.vel_limit, self.current_limit)
-
-    def current_limit_callback(self, msg: Float32):
-        """Set the ODrive current limit."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, ignoring current limit command')
-            return
-        self.current_limit = msg.data
-        self.set_limits(self.vel_limit, self.current_limit)
-
-    def rotate_callback(self, msg: Float32):
-        """Rotate the motor for the specified duration at 400 rad/s."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, ignoring rotate command')
-            return
-        duration = msg.data
-        if duration <= 0:
-            return
-        self.send_velocity_setpoint(400.0)  # Rotate at 400 rad/s
-        self.rotate_timer = self.create_timer(duration, self.stop_rotation)
-        self.get_logger().info(f'Started rotation for {duration} seconds')
-
-    def stop_rotation(self):
-        """Stop the rotation by setting velocity to 0."""
-        self.send_velocity_setpoint(0.0)
-        if self.rotate_timer is not None:
-            self.destroy_timer(self.rotate_timer)
-            self.rotate_timer = None
-        self.get_logger().info('Stopped rotation')
-
-    def send_velocity_setpoint(self, vel: float):
-        """Send open-loop velocity setpoint to ODrive."""
-        data = struct.pack('<f', vel)
-        try:
-            msg = can.Message(arbitration_id=0x200,  # 0x200 for node 0
-                              data=[0x0c] + list(data),  # 0x0c for open-loop velocity
-                              is_extended_id=False)
-            self.bus.send(msg)
-            self.get_logger().info(f'Sent open-loop velocity setpoint: {vel}')
-        except can.CanError as exc:
-            self.get_logger().error(f'Failed to send velocity setpoint: {exc}')
-
+    # Request error status from ODrive
     def request_errors(self):
-        """Request error status from ODrive."""
         try:
-            req = can.Message(arbitration_id=0x018,  # 0x018 for node 0 error request
+            node_id = 0  # jeśli Twoja oś ma ID = 0
+            arbitration_id = 0x018 + node_id # 0x018 for node 0, error request
+
+            req = can.Message(arbitration_id=arbitration_id,  # Standard protocol for Firmware ODrive 0.5.1 and later
                               is_remote_frame=True,
                               dlc=8)
-            self.bus.send(req)
-            self.get_logger().info('Requested error status')
+
+            self.bus.send(req) # Send CAN frame to request errors
+
+            self.get_logger().info('Requested error status') # Log success
+
         except can.CanError as exc:
-            self.get_logger().error(f'Failed to request errors: {exc}')
+            self.get_logger().error(f'Failed to request errors: {exc}') # Log failure
 
-    def velocity_setpoint_callback(self, msg: Float32):
-        """Set the velocity setpoint directly."""
-        self.send_velocity_setpoint(msg.data)
-        self.get_logger().info(f'Set velocity setpoint to {msg.data}')
-
-    def reset_errors_callback(self, msg: Bool):
-        """Reset errors on axis0."""
-        if self.bus is None:
-            self.get_logger().warn('CAN bus not available, ignoring reset errors command')
-            return
-        if not msg.data:
-            return
+    # Send velocity setpoint to ODrive
+    def send_velocity_setpoint(self, vel: float):
+        data = struct.pack('<f', vel) # Prepare velocity setpoint data, float 32bit little-endian
         try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x03, 0x00, 0x00, 0x00],
-                                is_extended_id=False)
-            self.bus.send(frame)
-            self.get_logger().info('Sent reset errors command')
+            node_id = 0  # jeśli Twoja oś ma ID = 0
+            arbitration_id = 0x200 * node_id  # Calculate arbitration ID for your node
+
+            msg = can.Message(arbitration_id=arbitration_id,  # Standard protocol for Firmware ODrive 0.5.1 and later
+                              data=[0x0c] + list(data),  # 0x0c for open-loop velocity
+                              is_extended_id=False)
+            self.bus.send(msg) # Send CAN frame with velocity setpoint
+
+            self.get_logger().info(f'Sent open-loop velocity setpoint: {vel}') # Log success
+
         except can.CanError as exc:
-            self.get_logger().error(f'Failed to reset errors: {exc}')
+            self.get_logger().error(f'Failed to send velocity setpoint: {exc}') # Log failure
+
+# TODO: Implement return message handling
+# TODO: Subscriptions, How they work etc
+# TODO: Callbacks for subscriptions
+# TODO: Evoking for different nodes
+# TODO: Hexadecimal representation of CAN IDs
 
 
 def main():
-    rclpy.init()
-    node = ODriveCANNode()
+    rclpy.init() # Initialize ROS2
+    node = ODriveCANNode() # Create ODrive CAN node instance
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        rclpy.spin(node) # Keep node running
+    except KeyboardInterrupt: 
+        pass # Allow graceful shutdown on Ctrl+C
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        node.destroy_node() # Clean up node
+        rclpy.shutdown() # Shutdown ROS2
 
 
 if __name__ == '__main__':
-    main()
+    main() # Run main function if script is executed directly
