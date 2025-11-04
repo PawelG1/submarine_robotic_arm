@@ -19,6 +19,7 @@ class ODriveCANNode(Node):
         self.get_logger().info('ODrive CAN node started') # Configure ODrive logger
 
         # Calibrate ODrive settings
+        self.reset_errors()  # Clear any existing errors
         self.set_axis_node_id(0)  # Ensure node ID is 0
         self.set_control_mode()  # Set to velocity control with vel_ramp input
         self.set_limits(400.0, 10.0)  # Set velocity limit to 400 rad/s, current limit to 10A
@@ -46,6 +47,23 @@ class ODriveCANNode(Node):
 
     # Define methods to configure ODrive via CAN
 
+    # Reset ODrive errors
+    def reset_errors(self):
+        try:
+            node_id = 0  # jeśli Twoja oś ma ID = 0
+            arbitration_id = 0x018 + node_id # 0x018 for node 0, reset errors
+
+            frame = can.Message(arbitration_id=arbitration_id,  # Standard protocol for Firmware ODrive 0.5.1 and later
+                                is_extended_id=False,
+                                dlc=0)
+
+            self.bus.send(frame) # Send CAN frame to reset errors
+
+            self.get_logger().info('Reset ODrive errors') # Log success
+
+        except can.CanError as exc:
+            self.get_logger().error(f'Failed to reset errors: {exc}') # Log failure
+
     # Set axis node ID
     def set_axis_node_id(self, node_id: int):
         data = node_id.to_bytes(4, 'little') # Prepare data to set node ID, Little-endian
@@ -55,8 +73,11 @@ class ODriveCANNode(Node):
             frame = can.Message(arbitration_id=arbitration_id,  # Command Set Axis Node ID
                                 data=list(data),
                                 is_extended_id=False)
+
             self.bus.send(frame) # Send CAN frame to set node ID
+
             self.get_logger().info(f'Set axis node ID to {node_id}') # Log success
+
         except can.CanError as exc:
             self.get_logger().error(f'Failed to set node ID: {exc}') # Log failure
 
