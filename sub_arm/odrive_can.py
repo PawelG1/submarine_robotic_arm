@@ -17,7 +17,7 @@ class ODriveCANNode(Node):
 
         self.get_logger().info('ODrive CAN node started')
         if self.bus is not None:
-            self.set_axis_node_id(0)  # Ensure node ID is 0
+            self.set_axis_node_id(16)  # Ensure node ID is 0
             self.set_control_mode()  # Set to velocity control with vel_ramp input
             self.set_limits(400.0, 10.0)  # Set velocity limit to 400 rad/s, current limit to 10A
             self.send_velocity_setpoint(0.0)  # Initialize to 0 velocity
@@ -49,10 +49,21 @@ class ODriveCANNode(Node):
                                  'odrive/velocity_setpoint',
                                  self.velocity_setpoint_callback,
                                  10)
+        self.create_subscription(Bool,
+                                 'odrive/request_errors',
+                                 self.request_errors_callback,
+                                 10)
+        self.create_subscription(Bool,
+                                 'odrive/set_sensorless_mode',
+                                 self.set_sensorless_mode_callback,
+                                 10)
         self.cealibrate_offset = False
         self.vel_limit = 1000.0  # Default velocity limit
         self.current_limit = 10.0  # Default current limit
         self.rotate_timer = None
+        
+        # Create timer to periodically request errors
+        self.create_timer(5.0, self.periodic_error_request)
 
     def set_axis_node_id(self, node_id: int):
         """Set ODrive axis node ID."""
@@ -110,7 +121,12 @@ class ODriveCANNode(Node):
             self.get_logger().error(f'Failed to set motor config: {exc}')
 
     def set_encoder_mode(self, mode: int):
-        """Set ODrive encoder mode."""
+        """Set ODrive encoder mode.
+        
+        Args:
+            mode: Encoder mode (1 = ENCODER_MODE_HALL, 2 = ENCODER_MODE_SINCOS, etc.)
+                  For sensorless (LOCKIN_SPIN), use mode 1
+        """
         if self.bus is None:
             self.get_logger().warn('CAN bus not available, skipping encoder mode')
             return
@@ -124,22 +140,47 @@ class ODriveCANNode(Node):
         except can.CanError as exc:
             self.get_logger().error(f'Failed to set encoder mode: {exc}')
 
+    def set_sensorless_mode(self):
+        """Set ODrive to sensorless mode (LOCKIN_SPIN).
+        
+        This configures the encoder for sensorless operation which is required
+        when running motors without encoder feedback.
+        """
+        if self.bus is None:
+            self.get_logger().warn('CAN bus not available, skipping sensorless mode setup')
+            return
+        
+        # Set encoder mode to LOCKIN_SPIN (mode 1)
+        self.set_encoder_mode(1)
+        self.get_logger().info('Configured ODrive for sensorless (LOCKIN_SPIN) mode')
+
     def set_limits(self, vel_limit: float, current_limit: float):
         """Set ODrive velocity and current limits."""
         if self.bus is None:
             self.get_logger().warn('CAN bus not available, skipping limits setup')
             return
+        
+        # Set velocity limit (command 0x0F)
         vel_data = struct.pack('<f', vel_limit)
-        current_data = struct.pack('<f', current_limit)
-        data = vel_data + current_data
         try:
-            frame = can.Message(arbitration_id=0x200,
-                                data=[0x0C] + list(data),
+            frame = can.Message(arbitration_id=0x00F,  # Set_Vel_Limit
+                                data=list(vel_data),
                                 is_extended_id=False)
             self.bus.send(frame)
-            self.get_logger().info(f'Set limits: velocity {vel_limit}, current {current_limit}')
+            self.get_logger().info(f'Set velocity limit: {vel_limit}')
         except can.CanError as exc:
-            self.get_logger().error(f'Failed to set limits: {exc}')
+            self.get_logger().error(f'Failed to set velocity limit: {exc}')
+        
+        # Set current limit (command 0x10)
+        current_data = struct.pack('<f', current_limit)
+        try:
+            frame = can.Message(arbitration_id=0x010,  # Set_Current_Limit
+                                data=list(current_data),
+                                is_extended_id=False)
+            self.bus.send(frame)
+            self.get_logger().info(f'Set current limit: {current_limit}')
+        except can.CanError as exc:
+            self.get_logger().error(f'Failed to set current limit: {exc}')
 
     def receive_message(self, msg: can.Message):
         """Handle incoming CAN frames."""
@@ -203,14 +244,26 @@ class ODriveCANNode(Node):
 
     def request_errors(self):
         """Request error status from ODrive."""
+        if self.bus is None:
+            return
         try:
-            req = can.Message(arbitration_id=0x018,  # 0x018 for node 0 error request
+            req = can.Message(arbitration_id=0x004,  # 0x004 for node 0 error request
                               is_remote_frame=True,
                               dlc=8)
             self.bus.send(req)
-            self.get_logger().info('Requested error status')
+            self.get_logger().debug('Requested error status')
         except can.CanError as exc:
             self.get_logger().error(f'Failed to request errors: {exc}')
+
+    def periodic_error_request(self):
+        """Periodically request error status from ODrive."""
+        self.request_errors()
+
+    def request_errors_callback(self, msg: Bool):
+        """Request error status when triggered via topic."""
+        if msg.data:
+            self.request_errors()
+            self.get_logger().info('Error status requested via topic')
 
     def velocity_setpoint_callback(self, msg: Float32):
         """Set the velocity setpoint directly."""
@@ -232,6 +285,11 @@ class ODriveCANNode(Node):
             self.get_logger().info('Sent reset errors command')
         except can.CanError as exc:
             self.get_logger().error(f'Failed to reset errors: {exc}')
+
+    def set_sensorless_mode_callback(self, msg: Bool):
+        """Enable sensorless (LOCKIN_SPIN) mode when triggered via topic."""
+        if msg.data:
+            self.set_sensorless_mode()
 
 
 def main():
