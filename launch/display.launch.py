@@ -67,12 +67,12 @@ def generate_launch_description():
             name='ik_ui_node',
             output='screen'
         ),
-        Node(
-            package='sub_arm',
-            executable='odrive_can',
-            name='odrive_can',
-            output='screen'
-        )
+        # Node(
+        #     package='sub_arm',
+        #     executable='odrive_can',
+        #     name='odrive_can',
+        #     output='screen'
+        # )
         #rviz2 - USUNIĘTY z powodu błędów biblioteki snap
         # Node(
         #     package='rviz2',
