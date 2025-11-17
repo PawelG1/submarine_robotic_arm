@@ -7,6 +7,9 @@ import board
 import busio
 from adafruit_pca9685 import PCA9685
 
+DEFAULT_FREQUENCY = 50
+DEFAULT_MIN_PULSE_US = 500.0
+DEFAULT_MAX_PULSE_US = 2500.0
 
 class PCA9685Node(Node):
     """
@@ -25,9 +28,9 @@ class PCA9685Node(Node):
     def __init__(self):
         super().__init__('pca9685_node')
         # Parametry (można zmienić z ROS2 param)
-        self.declare_parameter('frequency', 50)  # typowo 50Hz dla serw
-        self.declare_parameter('min_pulse_us', 500.0)
-        self.declare_parameter('max_pulse_us', 2500.0)
+        self.declare_parameter('frequency', DEFAULT_FREQUENCY)  # typowo 50Hz dla serw
+        self.declare_parameter('min_pulse_us', DEFAULT_MIN_PULSE_US)
+        self.declare_parameter('max_pulse_us', DEFAULT_MAX_PULSE_US)
 
         freq = self.get_parameter('frequency').get_parameter_value().integer_value
         self.min_us = self.get_parameter('min_pulse_us').get_parameter_value().double_value
@@ -44,12 +47,12 @@ class PCA9685Node(Node):
         self.command_subscription = self.create_subscription(
             Vector3,
             'servo_command',
-            self.command_callback,
+            self.set_servo_angle,
             10
         )
         self.command_subscription
 
-    def command_callback(self, msg: Vector3):
+    def set_servo_angle(self, msg: Vector3):
         """
         Nowy format sterowania: Vector3
         x -> channel (int), y -> angle (0..180)
@@ -95,6 +98,9 @@ class PCA9685Node(Node):
         # PCA9685 ma 12-bitowe rozdzielczości (0–4095)
         value = int(duty_cycle * 0xFFFF)  # biblioteka używa 16-bitów
         self.pca.channels[channel].duty_cycle = value
+
+    def testAllServos(self, timeout):
+        pass
 
 
 def main(args=None):

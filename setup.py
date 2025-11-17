@@ -35,6 +35,7 @@ setup(
             'ik_ui = sub_arm.ik_ui:main',
             'odrive_can = sub_arm.odrive_can:main',
             'pca9685_node = sub_arm.pca9685_node:main',
+            'wserver_ros = sub_arm.wserver_ros:main',
         ],
     },
 )
